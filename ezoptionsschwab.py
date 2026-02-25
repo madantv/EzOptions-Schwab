@@ -86,8 +86,8 @@ def init_db():
 # Function to store centroid data
 def store_centroid_data(ticker, price, calls, puts):
     """Store call and put centroid data for 5-minute intervals during market hours only"""
-    # Get current time in Eastern Time
-    est = pytz.timezone('US/Eastern')
+    # Get current time in Pacific Time
+    est = pytz.timezone('US/Pacific')
     current_time_est = datetime.now(est)
     
     # Check if we're in market hours (9:30 AM - 4:00 PM ET, Monday-Friday)
@@ -153,8 +153,8 @@ def store_centroid_data(ticker, price, calls, puts):
 def get_centroid_data(ticker, date=None):
     """Get centroid data for current trading session only (market hours)"""
     if date is None:
-        # Get current date in Eastern Time
-        est = pytz.timezone('US/Eastern')
+        # Get current date in Pacific Time
+        est = pytz.timezone('US/Pacific')
         current_date_est = datetime.now(est).strftime('%Y-%m-%d')
         date = current_date_est
     
@@ -173,8 +173,8 @@ def get_centroid_data(ticker, date=None):
             
             for row in all_data:
                 timestamp = row[0]
-                # Convert timestamp to Eastern Time
-                dt_est = datetime.fromtimestamp(timestamp, pytz.timezone('US/Eastern'))
+                # Convert timestamp to Pacific Time
+                dt_est = datetime.fromtimestamp(timestamp, pytz.timezone('US/Pacific'))
                 
                 # Check if within market hours
                 market_open = dt_est.replace(hour=9, minute=30, second=0, microsecond=0)
@@ -269,7 +269,7 @@ def get_interval_data(ticker, date=None):
 # Function to clear old data
 def clear_old_data():
     """Clear data from previous days, keeping only today's data"""
-    est = pytz.timezone('US/Eastern')
+    est = pytz.timezone('US/Pacific')
     today = datetime.now(est).strftime('%Y-%m-%d')
     
     with closing(sqlite3.connect('options_data.db')) as conn:
@@ -288,7 +288,7 @@ def clear_old_data():
 # Function to clear centroid data for new session
 def clear_centroid_session_data(ticker):
     """Clear centroid data at the start of a new trading session"""
-    est = pytz.timezone('US/Eastern')
+    est = pytz.timezone('US/Pacific')
     today = datetime.now(est).strftime('%Y-%m-%d')
     
     with closing(sqlite3.connect('options_data.db')) as conn:
@@ -304,7 +304,7 @@ def clear_centroid_session_data(ticker):
 init_db()
 
 # Clear old data at the start of the day
-est = pytz.timezone('US/Eastern')
+est = pytz.timezone('US/Pacific')
 current_time_est = datetime.now(est)
 
 # Clear old data at midnight ET
@@ -426,12 +426,12 @@ def aggregate_by_strike(df, value_columns, strike_interval):
 
 def calculate_time_to_expiration(expiry_date):
     """
-    Calculate time to expiration in years using Eastern Time.
+    Calculate time to expiration in years using Pacific Time.
     expiry_date: datetime.date object or string 'YYYY-MM-DD'
     Returns: time in years (float)
     """
     try:
-        et_tz = pytz.timezone('US/Eastern')
+        et_tz = pytz.timezone('US/Pacific')
         now_et = datetime.now(et_tz)
         
         if isinstance(expiry_date, str):
@@ -666,21 +666,45 @@ def fetch_options_for_date(ticker, date, exposure_metric="Open Interest", delta_
 
     try:
         expiry = datetime.strptime(date, '%Y-%m-%d').date()
+
+        # Warn about requesting same-day expiration (0DTE)
+        today = datetime.now().date()
+        is_0dte = (expiry == today)
+
         chain_response = client.option_chains(
             symbol=ticker,
             fromDate=expiry.strftime('%Y-%m-%d'),
             toDate=expiry.strftime('%Y-%m-%d'),
             contractType='ALL'
         )
-        
+
         if not chain_response.ok:
             try:
                 error_data = chain_response.json()
                 error_msg = error_data.get('error', 'Unknown API error')
                 if 'error_description' in error_data:
                     error_msg += f": {error_data['error_description']}"
+
+                # Provide helpful error messages
+                if 'errors' in error_data:
+                    errors = error_data['errors']
+                    if len(errors) > 0:
+                        detail = errors[0].get('detail', '')
+                        if is_0dte and ('Param' in detail or 'Invalid' in detail or 'Bad Request' in str(error_data)):
+                            # Specific message for 0DTE limitation
+                            raise Exception("⚠️ Same-Day (0DTE) Options Not Available\n\n"
+                                          f"Schwab API does not support retrieving options expiring today ({date}).\n\n"
+                                          "Options:\n"
+                                          "• Select tomorrow or a later expiration date\n"
+                                          "• Use Schwab's website or thinkorswim for 0DTE data\n"
+                                          "• Wait until after market close to view this expiration's historical data")
+                        elif 'Param' in detail or 'Invalid' in detail:
+                            error_msg = f"Invalid request parameters. Check ticker symbol or try a different expiration date."
+
                 raise Exception(f"Schwab API Error: {error_msg}")
-            except:
+            except Exception as e:
+                if '0DTE' in str(e) or 'Same-Day' in str(e):
+                    raise  # Re-raise our custom 0DTE message
                 raise Exception(f"Schwab API Error: {chain_response.status_code} {chain_response.reason}")
         
         chain = chain_response.json()
@@ -2020,7 +2044,7 @@ def get_price_history(ticker, timeframe=1):
         ticker = "SPY"
     try:
         # Get current time in EST
-        est = datetime.now(pytz.timezone('US/Eastern'))
+        est = datetime.now(pytz.timezone('US/Pacific'))
         current_date = est.date()
         
         # Calculate start date (5 days ago to ensure we get previous trading day)
@@ -2057,7 +2081,7 @@ def get_price_history(ticker, timeframe=1):
         # Get previous trading day's close
         prev_day_candles = []
         for candle in reversed(candles):
-            candle_time = datetime.fromtimestamp(candle['datetime']/1000, pytz.timezone('US/Eastern'))
+            candle_time = datetime.fromtimestamp(candle['datetime']/1000, pytz.timezone('US/Pacific'))
             if candle_time.date() < current_date:
                 prev_day_candles.append(candle)
                 if len(prev_day_candles) >= 30:  # Get at least 30 minutes of data
@@ -2080,8 +2104,8 @@ def filter_market_hours(candles):
     filtered_candles = []
     for candle in candles:
         dt = datetime.fromtimestamp(candle['datetime']/1000)
-        # Convert to Eastern Time
-        et = dt.astimezone(pytz.timezone('US/Eastern'))
+        # Convert to Pacific Time
+        et = dt.astimezone(pytz.timezone('US/Pacific'))
         # Check if it's a weekday and within market hours
         if et.weekday() < 5:  # 0-4 is Monday-Friday
             market_open = et.replace(hour=9, minute=30, second=0, microsecond=0)
@@ -2148,13 +2172,13 @@ def create_price_chart(price_data, calls=None, puts=None, exposure_levels_types=
         return go.Figure().to_json()
     
     # Get current time in EST
-    est = datetime.now(pytz.timezone('US/Eastern'))
+    est = datetime.now(pytz.timezone('US/Pacific'))
     current_date = est.date()
     
     # Sort candles by datetime and remove duplicates
     unique_candles = {}
     for candle in candles:
-        candle_time = datetime.fromtimestamp(candle['datetime']/1000, pytz.timezone('US/Eastern'))
+        candle_time = datetime.fromtimestamp(candle['datetime']/1000, pytz.timezone('US/Pacific'))
         unique_candles[candle_time] = candle
     
     # Convert back to list and sort
@@ -2164,7 +2188,7 @@ def create_price_chart(price_data, calls=None, puts=None, exposure_levels_types=
     # Filter for current day's candles only
     current_day_candles = []
     for candle in all_candles:
-        candle_time = datetime.fromtimestamp(candle['datetime']/1000, pytz.timezone('US/Eastern'))
+        candle_time = datetime.fromtimestamp(candle['datetime']/1000, pytz.timezone('US/Pacific'))
         # Convert both dates to EST and compare
         candle_date = candle_time.date()
         if candle_date == current_date:
@@ -2174,12 +2198,12 @@ def create_price_chart(price_data, calls=None, puts=None, exposure_levels_types=
     if not current_day_candles:
         # Get the most recent trading day
         most_recent_day = max(candle['datetime'] for candle in all_candles)
-        most_recent_day = datetime.fromtimestamp(most_recent_day/1000, pytz.timezone('US/Eastern')).date()
+        most_recent_day = datetime.fromtimestamp(most_recent_day/1000, pytz.timezone('US/Pacific')).date()
         
         # Filter candles for most recent trading day
         current_day_candles = []
         for candle in all_candles:
-            candle_time = datetime.fromtimestamp(candle['datetime']/1000, pytz.timezone('US/Eastern'))
+            candle_time = datetime.fromtimestamp(candle['datetime']/1000, pytz.timezone('US/Pacific'))
             if candle_time.date() == most_recent_day:
                 current_day_candles.append(candle)
     
@@ -2195,7 +2219,7 @@ def create_price_chart(price_data, calls=None, puts=None, exposure_levels_types=
     # Get previous day's close
     previous_day_close = None
     for candle in reversed(all_candles):
-        candle_time = datetime.fromtimestamp(candle['datetime']/1000, pytz.timezone('US/Eastern'))
+        candle_time = datetime.fromtimestamp(candle['datetime']/1000, pytz.timezone('US/Pacific'))
         if candle_time.date() < current_date:
             previous_day_close = candle['close']
             break
@@ -3553,7 +3577,7 @@ def create_premium_chart(calls, puts, S, strike_range=0.02, call_color='#00FF00'
 def create_centroid_chart(ticker, call_color='#00FF00', put_color='#FF0000', selected_expiries=None):
     """Create a chart showing call and put centroids over time with price line"""
     # Check if we're in market hours
-    est = pytz.timezone('US/Eastern')
+    est = pytz.timezone('US/Pacific')
     current_time_est = datetime.now(est)
     
     # Get centroid data from database
@@ -4490,6 +4514,7 @@ def index():
                     <div class="settings-control">
                         <button id="saveSettings" title="Save current settings to file">💾 Save</button>
                         <button id="loadSettings" title="Load settings from file">📂 Load</button>
+                        <button id="testAlert" title="Test alert system" onclick="testAlert()">🔔 Test Alert</button>
                     </div>
                 </div>
             </div>
@@ -4997,7 +5022,178 @@ def index():
                 updateData();
             });
         });
-        
+
+        // ============================================================================
+        // ALERT SYSTEM
+        // ============================================================================
+
+        let seenAlertIds = new Set();
+        let alertsEnabled = true;
+        let browserNotificationsEnabled = false;
+        let audioAlertsEnabled = true;
+
+        // Request notification permission
+        function requestNotificationPermission() {
+            if ('Notification' in window && Notification.permission === 'default') {
+                Notification.requestPermission().then(permission => {
+                    if (permission === 'granted') {
+                        console.log('Notification permission granted');
+                        browserNotificationsEnabled = true;
+                        showSuccess('Browser notifications enabled');
+                    }
+                });
+            } else if ('Notification' in window && Notification.permission === 'granted') {
+                browserNotificationsEnabled = true;
+            }
+        }
+
+        // Show browser notification
+        function showBrowserNotification(alert) {
+            if ('Notification' in window && Notification.permission === 'granted' && browserNotificationsEnabled) {
+                const notification = new Notification(`${alert.ticker} - ${alert.urgency}`, {
+                    body: alert.message,
+                    icon: '/static/alert-icon.png',
+                    tag: alert.alert_type,
+                    requireInteraction: alert.urgency === 'CRITICAL',
+                });
+
+                // Play audio based on urgency
+                if (audioAlertsEnabled) {
+                    playAlertSound(alert.urgency);
+                }
+
+                notification.onclick = function() {
+                    window.focus();
+                    this.close();
+                };
+            }
+        }
+
+        // Audio alerts with different sounds per urgency
+        function playAlertSound(urgency) {
+            if (!audioAlertsEnabled) return;
+
+            // Use different frequencies for different urgency levels
+            const ctx = new (window.AudioContext || window.webkitAudioContext)();
+            const oscillator = ctx.createOscillator();
+            const gainNode = ctx.createGain();
+
+            oscillator.connect(gainNode);
+            gainNode.connect(ctx.destination);
+
+            // Set frequency and duration based on urgency
+            const params = {
+                'CRITICAL': { freq: 1000, duration: 0.3, repeat: 3 },
+                'HIGH': { freq: 800, duration: 0.2, repeat: 2 },
+                'MEDIUM': { freq: 600, duration: 0.15, repeat: 1 },
+                'LOW': { freq: 400, duration: 0.1, repeat: 1 }
+            };
+
+            const param = params[urgency] || params['MEDIUM'];
+
+            let count = 0;
+            function beep() {
+                oscillator.frequency.value = param.freq;
+                oscillator.type = 'sine';
+                gainNode.gain.setValueAtTime(0.3, ctx.currentTime);
+                gainNode.gain.exponentialRampToValueAtTime(0.01, ctx.currentTime + param.duration);
+
+                if (count === 0) {
+                    oscillator.start(ctx.currentTime);
+                }
+
+                count++;
+                if (count < param.repeat) {
+                    setTimeout(beep, param.duration * 1000 + 100);
+                } else {
+                    oscillator.stop(ctx.currentTime + param.duration);
+                }
+            }
+
+            beep();
+        }
+
+        // Check for new alerts
+        function checkForAlerts() {
+            if (!alertsEnabled) return;
+
+            fetch('/api/alerts/recent?hours=1')
+                .then(response => response.json())
+                .then(data => {
+                    if (data.alerts) {
+                        data.alerts.forEach(alert => {
+                            if (!seenAlertIds.has(alert.id)) {
+                                showBrowserNotification(alert);
+                                displayAlertInUI(alert);
+                                seenAlertIds.add(alert.id);
+                            }
+                        });
+                    }
+                })
+                .catch(error => {
+                    console.error('Error checking alerts:', error);
+                });
+        }
+
+        // Display alert in UI (banner notification)
+        function displayAlertInUI(alert) {
+            const container = document.getElementById('error-notification');
+            if (!container) return;
+
+            // Style based on urgency
+            const colors = {
+                'CRITICAL': '#FF0000',
+                'HIGH': '#FF9900',
+                'MEDIUM': '#FFFF00',
+                'LOW': '#00FF00'
+            };
+
+            const bgColor = colors[alert.urgency] || '#808080';
+
+            container.style.backgroundColor = bgColor;
+            container.style.color = alert.urgency === 'MEDIUM' ? '#000' : '#FFF';
+            container.textContent = `🚨 ${alert.ticker}: ${alert.message.split('\\n')[0]}`;
+            container.style.display = 'block';
+
+            // Auto-hide after 10 seconds for non-critical alerts
+            if (alert.urgency !== 'CRITICAL') {
+                setTimeout(() => {
+                    container.style.display = 'none';
+                }, 10000);
+            }
+        }
+
+        // Test alert function
+        function testAlert() {
+            fetch('/api/alerts/test')
+                .then(response => response.json())
+                .then(data => {
+                    if (data.alert) {
+                        showSuccess('Test alert sent!');
+                        setTimeout(() => {
+                            showBrowserNotification(data.alert);
+                            displayAlertInUI(data.alert);
+                        }, 1000);
+                    }
+                })
+                .catch(error => {
+                    showError('Error sending test alert: ' + error);
+                });
+        }
+
+        // Initialize alert system
+        requestNotificationPermission();
+
+        // Poll for alerts every 10 seconds
+        setInterval(checkForAlerts, 10000);
+
+        // Check immediately on load
+        setTimeout(checkForAlerts, 2000);
+
+        // ============================================================================
+        // END ALERT SYSTEM
+        // ============================================================================
+
         function updateData() {
             if (updateInProgress) {
                 return; // Skip if an update is already in progress
@@ -5482,20 +5678,31 @@ def index():
                     const buttons = optionsContainer.querySelector('.expiry-buttons');
                     optionsContainer.innerHTML = '';
                     
+                    // Mark today's date as 0DTE (not supported by Schwab API, but shown with warning)
+                    const today = new Date().toISOString().split('T')[0];
+
                     data.forEach(date => {
+                        const is0DTE = (date === today);
                         const optionDiv = document.createElement('div');
                         optionDiv.className = 'expiry-option';
-                        
+                        if (is0DTE) {
+                            optionDiv.style.opacity = '0.6';
+                        }
+
                         const checkbox = document.createElement('input');
                         checkbox.type = 'checkbox';
                         checkbox.value = date;
                         checkbox.id = 'expiry-' + date;
-                        
+
                         const label = document.createElement('label');
                         label.htmlFor = 'expiry-' + date;
-                        label.textContent = date;
+                        label.textContent = is0DTE ? date + ' (0DTE - API Limited)' : date;
                         label.style.cursor = 'pointer';
                         label.style.flex = '1';
+                        if (is0DTE) {
+                            label.style.color = '#FF9900';
+                            label.title = 'Same-day options: Schwab API has limited support. May show error or cached data.';
+                        }
                         
                         // Restore previous selections if they still exist
                         if (previousSelections.includes(date)) {
@@ -5901,7 +6108,7 @@ def update():
         store_interval_data(ticker, S, strike_range, calls, puts)
         
         # Check if this is the first access of the day for this ticker and clear centroid data if needed
-        est = pytz.timezone('US/Eastern')
+        est = pytz.timezone('US/Pacific')
         current_time_est = datetime.now(est)
         
         # Check if we're in a new trading session (after 9:30 AM ET)
@@ -5929,7 +6136,24 @@ def update():
         
         # Store centroid data
         store_centroid_data(ticker, S, calls, puts)
-        
+
+        # Update alert engine with new data
+        try:
+            from alert_engine import get_alert_engine
+            alert_engine = get_alert_engine()
+            alert_engine.update_data(
+                ticker=ticker,
+                price=S,
+                calls=calls,
+                puts=puts,
+                strike_range=strike_range,
+                exposure_metric=exposure_metric
+            )
+            # Check for alerts
+            alert_engine.check_alerts()
+        except Exception as e:
+            print(f"Alert engine error: {e}")
+
         # Clear centroid data at the end of the day
         current_time = datetime.now()
         if current_time.hour == 23 and current_time.minute == 59:
@@ -6146,6 +6370,123 @@ def load_settings():
             return jsonify({'error': 'No settings file found'})
     except Exception as e:
         return jsonify({'error': str(e)})
+
+# ============================================================================
+# ALERT SYSTEM ENDPOINTS
+# ============================================================================
+
+@app.route('/api/alerts/recent')
+def get_recent_alerts():
+    """Get alerts from the last hour"""
+    try:
+        from alert_engine import get_alert_engine
+        alert_engine = get_alert_engine()
+
+        hours = request.args.get('hours', 1, type=int)
+        recent_alerts = alert_engine.get_recent_alerts(hours=hours)
+
+        return jsonify({
+            'alerts': [alert.to_dict() for alert in recent_alerts],
+            'count': len(recent_alerts)
+        })
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/alerts/all')
+def get_all_alerts():
+    """Get all alerts in history"""
+    try:
+        from alert_engine import get_alert_engine
+        alert_engine = get_alert_engine()
+
+        all_alerts = alert_engine.get_all_alerts()
+
+        return jsonify({
+            'alerts': [alert.to_dict() for alert in all_alerts],
+            'count': len(all_alerts)
+        })
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/alerts/config', methods=['GET'])
+def get_alert_config():
+    """Get current alert configuration"""
+    try:
+        from alert_engine import get_alert_engine
+        alert_engine = get_alert_engine()
+
+        config = alert_engine.get_config()
+        return jsonify(config)
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/alerts/config', methods=['POST'])
+def update_alert_config():
+    """Update alert configuration"""
+    try:
+        from alert_engine import get_alert_engine
+        alert_engine = get_alert_engine()
+
+        config = request.get_json()
+        alert_engine.update_config(config)
+
+        return jsonify({'status': 'success', 'message': 'Alert configuration updated'})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/alerts/test')
+def test_alert():
+    """Send a test alert to verify configuration"""
+    try:
+        from alert_engine import get_alert_engine, Alert
+        alert_engine = get_alert_engine()
+
+        test_alert = Alert(
+            alert_type="test",
+            ticker="TEST",
+            urgency="MEDIUM",
+            message="🧪 This is a test alert. Your notification system is working correctly!",
+            data={'test': True}
+        )
+
+        alert_engine.alert_history.append(test_alert)
+
+        return jsonify({
+            'status': 'success',
+            'alert': test_alert.to_dict()
+        })
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/alerts/check')
+def check_alerts_now():
+    """Manually trigger alert check (useful for testing)"""
+    try:
+        from alert_engine import get_alert_engine
+        alert_engine = get_alert_engine()
+
+        new_alerts = alert_engine.check_alerts()
+
+        return jsonify({
+            'status': 'success',
+            'alerts': [alert.to_dict() for alert in new_alerts],
+            'count': len(new_alerts)
+        })
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/alerts/clear')
+def clear_alert_history():
+    """Clear alert history"""
+    try:
+        from alert_engine import get_alert_engine
+        alert_engine = get_alert_engine()
+
+        alert_engine.clear_history()
+
+        return jsonify({'status': 'success', 'message': 'Alert history cleared'})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
 
 if __name__ == '__main__':
     app.run(debug=True, port=5001)
