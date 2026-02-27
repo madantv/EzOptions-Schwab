@@ -2037,15 +2037,16 @@ def update_options_chain(ticker, expiration_date=None):
     except Exception as e:
         print(f"Error updating options chain: {e}")
 
-def get_price_history(ticker, timeframe=1):
+def get_price_history(ticker, timeframe=1, timezone='America/New_York'):
     if ticker == "MARKET":
         ticker = "$SPX"
     elif ticker == "MARKET2":
         ticker = "SPY"
     try:
-        # Get current time in EST
-        est = datetime.now(pytz.timezone('US/Pacific'))
-        current_date = est.date()
+        # Get current time in the specified timezone
+        tz = pytz.timezone(timezone)
+        current_time = datetime.now(tz)
+        current_date = current_time.date()
         
         # Calculate start date (5 days ago to ensure we get previous trading day)
         start_date = datetime.combine(current_date - timedelta(days=5), datetime.min.time())
@@ -2070,18 +2071,19 @@ def get_price_history(ticker, timeframe=1):
         if not data or 'candles' not in data:
             raise Exception("Malformed price history data from Schwab API")
 
-        # Filter for market hours
-        candles = filter_market_hours(data['candles'])
+        # Get all candles (no filtering here - let the chart function handle it)
+        candles = data['candles']
         if not candles:
-            raise Exception("No market-hour candles returned from Schwab API")
+            raise Exception("No candles returned from Schwab API")
 
         # Sort candles by timestamp
         candles.sort(key=lambda x: x['datetime'])
 
-        # Get previous trading day's close
+        # Get previous trading day's close from regular market hours only
+        market_hour_candles = filter_market_hours(candles)
         prev_day_candles = []
-        for candle in reversed(candles):
-            candle_time = datetime.fromtimestamp(candle['datetime']/1000, pytz.timezone('US/Pacific'))
+        for candle in reversed(market_hour_candles):
+            candle_time = datetime.fromtimestamp(candle['datetime']/1000, tz)
             if candle_time.date() < current_date:
                 prev_day_candles.append(candle)
                 if len(prev_day_candles) >= 30:  # Get at least 30 minutes of data
@@ -2091,8 +2093,9 @@ def get_price_history(ticker, timeframe=1):
         prev_day_close = prev_day_candles[-1]['close'] if prev_day_candles else None
 
         return {
-            'candles': candles,
-            'prev_day_close': prev_day_close
+            'candles': candles,  # Return ALL candles (extended hours included)
+            'prev_day_close': prev_day_close,
+            'timezone': timezone  # Include timezone in response
         }
     except Exception as e:
         msg = f"[DEBUG] Error fetching price history: {e}"
@@ -2111,6 +2114,23 @@ def filter_market_hours(candles):
             market_open = et.replace(hour=9, minute=30, second=0, microsecond=0)
             market_close = et.replace(hour=16, minute=0, second=0, microsecond=0)
             if market_open <= et <= market_close:
+                filtered_candles.append(candle)
+    return filtered_candles
+
+def filter_extended_hours(candles):
+    """Filter candles for extended hours (4:00 AM - 8:00 PM ET) including pre-market, market, and post-market"""
+    filtered_candles = []
+    et_tz = pytz.timezone('America/New_York')  # US markets operate on Eastern Time
+
+    for candle in candles:
+        dt = datetime.fromtimestamp(candle['datetime']/1000, pytz.UTC)
+        # Convert to Eastern Time (US market time)
+        et = dt.astimezone(et_tz)
+        # Check if it's a weekday and within extended hours (4 AM - 8 PM ET)
+        if et.weekday() < 5:  # 0-4 is Monday-Friday
+            extended_start = et.replace(hour=4, minute=0, second=0, microsecond=0)
+            extended_end = et.replace(hour=20, minute=0, second=0, microsecond=0)
+            if extended_start <= et <= extended_end:
                 filtered_candles.append(candle)
     return filtered_candles
 
@@ -2155,7 +2175,7 @@ def convert_to_heikin_ashi(candles):
     
     return ha_candles
 
-def create_price_chart(price_data, calls=None, puts=None, exposure_levels_types=[], exposure_levels_count=3, call_color='#00FF00', put_color='#FF0000', strike_range=0.02, use_heikin_ashi=False, highlight_max_level=False, max_level_color='#800080'):
+def create_price_chart(price_data, calls=None, puts=None, exposure_levels_types=[], exposure_levels_count=3, call_color='#00FF00', put_color='#FF0000', strike_range=0.02, use_heikin_ashi=False, highlight_max_level=False, max_level_color='#800080', timezone='America/New_York'):
     # Handle backward compatibility or empty default
     if isinstance(exposure_levels_types, str):
         if exposure_levels_types == 'None':
@@ -2165,69 +2185,50 @@ def create_price_chart(price_data, calls=None, puts=None, exposure_levels_types=
             
     if not price_data or 'candles' not in price_data or not price_data['candles']:
         return go.Figure().to_json()
-    
-    # Filter for market hours
-    candles = filter_market_hours(price_data['candles'])
+
+    # Filter for extended hours (pre-market, market, post-market)
+    candles = filter_extended_hours(price_data['candles'])
     if not candles:
         return go.Figure().to_json()
-    
-    # Get current time in EST
-    est = datetime.now(pytz.timezone('US/Pacific'))
-    current_date = est.date()
-    
+
+    # Get current time in the specified timezone
+    tz = pytz.timezone(timezone)
+    current_time = datetime.now(tz)
+    current_date = current_time.date()
+
     # Sort candles by datetime and remove duplicates
+    # IMPORTANT: Convert timestamps from UTC to the specified timezone
     unique_candles = {}
     for candle in candles:
-        candle_time = datetime.fromtimestamp(candle['datetime']/1000, pytz.timezone('US/Pacific'))
+        # Create timezone-aware datetime from UTC timestamp
+        candle_time = datetime.fromtimestamp(candle['datetime']/1000, pytz.UTC).astimezone(tz)
         unique_candles[candle_time] = candle
-    
+
     # Convert back to list and sort
     sorted_candles = sorted(unique_candles.items(), key=lambda x: x[0])
     all_candles = [candle for _, candle in sorted_candles]
-    
-    # Filter for current day's candles only
-    current_day_candles = []
-    for candle in all_candles:
-        candle_time = datetime.fromtimestamp(candle['datetime']/1000, pytz.timezone('US/Pacific'))
-        # Convert both dates to EST and compare
-        candle_date = candle_time.date()
-        if candle_date == current_date:
-            current_day_candles.append(candle)
-    
-    # If no current day candles, use the most recent day's candles
-    if not current_day_candles:
-        # Get the most recent trading day
-        most_recent_day = max(candle['datetime'] for candle in all_candles)
-        most_recent_day = datetime.fromtimestamp(most_recent_day/1000, pytz.timezone('US/Pacific')).date()
-        
-        # Filter candles for most recent trading day
-        current_day_candles = []
-        for candle in all_candles:
-            candle_time = datetime.fromtimestamp(candle['datetime']/1000, pytz.timezone('US/Pacific'))
-            if candle_time.date() == most_recent_day:
-                current_day_candles.append(candle)
-    
-    # Use all candles for calculations but current day candles for display
+
+    # Display ALL candles from the last 5 days (no filtering by current day)
+    # This gives us the full 5-day history view
+    display_candles = all_candles
+
+    # Apply Heikin-Ashi if requested
     if use_heikin_ashi:
-        ha_candles = convert_to_heikin_ashi(all_candles)  # Use all candles for calculations
-        display_candles = convert_to_heikin_ashi(current_day_candles)  # Use current day for display
-    else:
-        # Use regular candles
-        ha_candles = all_candles
-        display_candles = current_day_candles
-    
+        display_candles = convert_to_heikin_ashi(display_candles)
+
     # Get previous day's close
     previous_day_close = None
     for candle in reversed(all_candles):
-        candle_time = datetime.fromtimestamp(candle['datetime']/1000, pytz.timezone('US/Pacific'))
+        candle_time = datetime.fromtimestamp(candle['datetime']/1000, pytz.UTC).astimezone(tz)
         if candle_time.date() < current_date:
             previous_day_close = candle['close']
             break
-    
+
     if previous_day_close is None:
         previous_day_close = display_candles[0]['close'] if display_candles else 0
-    
-    dates = [datetime.fromtimestamp(candle['datetime']/1000) for candle in display_candles]
+
+    # IMPORTANT: Convert timestamps to timezone-aware datetime objects for proper axis display
+    dates = [datetime.fromtimestamp(candle['datetime']/1000, pytz.UTC).astimezone(tz) for candle in display_candles]
     opens = [candle['open'] for candle in display_candles]
     highs = [candle['high'] for candle in display_candles]
     lows = [candle['low'] for candle in display_candles]
@@ -2273,6 +2274,46 @@ def create_price_chart(price_data, calls=None, puts=None, exposure_levels_types=
         decreasing_fillcolor=put_color
     ))
     
+    # Calculate VWAP (Volume Weighted Average Price) - resets daily
+    vwap_values = []
+    cumulative_tp_volume = 0  # Cumulative (typical price * volume)
+    cumulative_volume = 0      # Cumulative volume
+    current_vwap_date = None   # Track current date for daily reset
+
+    for i in range(len(display_candles)):
+        # Get the date of this candle
+        candle_date = dates[i].date()
+
+        # Reset VWAP calculation at start of each new trading day
+        if current_vwap_date != candle_date:
+            cumulative_tp_volume = 0
+            cumulative_volume = 0
+            current_vwap_date = candle_date
+
+        # Typical price = (high + low + close) / 3
+        typical_price = (highs[i] + lows[i] + closes[i]) / 3
+        volume = volumes[i]
+
+        cumulative_tp_volume += typical_price * volume
+        cumulative_volume += volume
+
+        # Calculate VWAP
+        if cumulative_volume > 0:
+            vwap = cumulative_tp_volume / cumulative_volume
+            vwap_values.append(vwap)
+        else:
+            vwap_values.append(None)
+
+    # Add VWAP line to the chart
+    fig.add_trace(go.Scatter(
+        x=dates,
+        y=vwap_values,
+        mode='lines',
+        name='VWAP',
+        line=dict(color='#FFA500', width=2, dash='solid'),  # Orange color
+        hovertemplate='VWAP: $%{y:.2f}<extra></extra>'
+    ))
+
     # Modify the volume trace coloring
     volume_colors = []
     for i in range(len(closes)):
@@ -2284,7 +2325,7 @@ def create_price_chart(price_data, calls=None, puts=None, exposure_levels_types=
             is_up = closes[i] >= closes[i-1]
         # Use call_color for up volume and put_color for down volume
         volume_colors.append(call_color if is_up else put_color)
-    
+
     # Update the volume trace with the new colors
     fig.add_trace(go.Bar(
         x=dates,
@@ -2297,9 +2338,106 @@ def create_price_chart(price_data, calls=None, puts=None, exposure_levels_types=
     ))
     
 
-    
+
+    # Define trading session times - US markets operate on Eastern Time
+    # Create session boundaries in ET, then convert to user's selected timezone
+    et_tz = pytz.timezone('America/New_York')
+
+    # Get unique dates from the candles to create session backgrounds for all days
+    unique_dates = sorted(set(d.date() for d in dates))
+
+    # Set x-axis range to show all available data (first to last candle)
+    xaxis_range = [dates[0], dates[-1]]
+
+    # Create session boundaries for each unique trading day
+    shapes = []
+    for session_date in unique_dates:
+        # Create times in Eastern Time for this date
+        pre_market_start_et = et_tz.localize(datetime.combine(session_date, datetime.min.time()).replace(hour=4, minute=0))
+        pre_market_end_et = et_tz.localize(datetime.combine(session_date, datetime.min.time()).replace(hour=9, minute=30))
+        market_close_et = et_tz.localize(datetime.combine(session_date, datetime.min.time()).replace(hour=16, minute=0))
+        post_market_end_et = et_tz.localize(datetime.combine(session_date, datetime.min.time()).replace(hour=20, minute=0))
+
+        # Convert ET times to user's selected timezone for display
+        pre_market_start = pre_market_start_et.astimezone(tz)
+        pre_market_end = pre_market_end_et.astimezone(tz)
+        market_open = pre_market_end
+        market_close = market_close_et.astimezone(tz)
+        post_market_end = post_market_end_et.astimezone(tz)
+
+        # Pre-market background (4:00 AM - 9:30 AM) - Dark blue
+        shapes.append(dict(
+            type="rect",
+            xref="x",
+            yref="paper",
+            x0=pre_market_start,
+            y0=0,
+            x1=pre_market_end,
+            y1=1,
+            fillcolor="rgba(0, 100, 200, 0.1)",
+            layer="below",
+            line_width=0,
+        ))
+
+        # Post-market background (4:00 PM - 8:00 PM) - Dark purple
+        shapes.append(dict(
+            type="rect",
+            xref="x",
+            yref="paper",
+            x0=market_close,
+            y0=0,
+            x1=post_market_end,
+            y1=1,
+            fillcolor="rgba(150, 0, 150, 0.1)",
+            layer="below",
+            line_width=0,
+        ))
+
+        # Vertical line to mark market open (9:30 AM)
+        shapes.append(dict(
+            type="line",
+            xref="x",
+            yref="paper",
+            x0=market_open,
+            y0=0,
+            x1=market_open,
+            y1=1,
+            line=dict(color="rgba(255, 255, 255, 0.3)", width=1, dash="dot"),
+            layer="below"
+        ))
+
+        # Vertical line to mark market close (4:00 PM)
+        shapes.append(dict(
+            type="line",
+            xref="x",
+            yref="paper",
+            x0=market_close,
+            y0=0,
+            x1=market_close,
+            y1=1,
+            line=dict(color="rgba(255, 255, 255, 0.3)", width=1, dash="dot"),
+            layer="below"
+        ))
+
     # Update layout with subplots
     chart_title = 'Price Chart (Heikin-Ashi)' if use_heikin_ashi else 'Price Chart'
+    # Create timezone display label
+    tz_abbrev_map = {
+        'America/New_York': 'ET',
+        'America/Chicago': 'CT',
+        'America/Denver': 'MT',
+        'America/Los_Angeles': 'PT',
+        'Europe/London': 'GMT',
+        'Europe/Paris': 'CET',
+        'Asia/Tokyo': 'JST',
+        'Asia/Hong_Kong': 'HKT',
+        'Asia/Singapore': 'SGT',
+        'Asia/Shanghai': 'CST',
+        'Asia/Dubai': 'GST',
+        'Asia/Kolkata': 'IST'
+    }
+    tz_label = tz_abbrev_map.get(timezone, timezone.split('/')[-1])
+
     fig.update_layout(
         title=dict(
             text=chart_title,
@@ -2309,7 +2447,7 @@ def create_price_chart(price_data, calls=None, puts=None, exposure_levels_types=
             y=0.98
         ),
         xaxis=dict(
-            title='',
+            title=f'Time ({tz_label})',
             title_font=dict(color='#CCCCCC'),
             tickfont=dict(color='#CCCCCC'),
             gridcolor='#333333',
@@ -2318,11 +2456,13 @@ def create_price_chart(price_data, calls=None, puts=None, exposure_levels_types=
             zeroline=True,
             zerolinecolor='#333333',
             rangeslider=dict(visible=False),
-            tickformat='%H:%M',
+            tickformat='%m/%d %H:%M',  # Show date and time for multi-day view
             showline=True,
             linewidth=1,
             mirror=True,
-            domain=[0, 1]
+            domain=[0, 1],
+            autorange=True,  # Auto-fit to all data initially
+            fixedrange=False  # Allow user to zoom and pan
         ),
         yaxis=dict(
             title='Price',
@@ -2400,9 +2540,11 @@ def create_price_chart(price_data, calls=None, puts=None, exposure_levels_types=
                 yanchor='middle',
                 xshift=1  # Moved left
             )
-        ]
+        ],
+        # Add background shapes for trading sessions across all days
+        shapes=shapes
     )
-    
+
     # Logic to add Exposure Levels to Price Chart
     if exposure_levels_types and calls is not None and puts is not None:
         # Filter options within strike range for better visualization
@@ -4037,6 +4179,87 @@ def index():
         .chart-checkbox label {
             cursor: pointer;
         }
+
+        /* Tab Styles */
+        .tabs-container {
+            background-color: #1E1E1E;
+            padding: 10px 20px 0 20px;
+            position: sticky;
+            top: 0;
+            z-index: 1000;
+        }
+        .tabs-nav {
+            display: flex;
+            align-items: center;
+            gap: 5px;
+            overflow-x: auto;
+            max-width: 100%;
+        }
+        .tab {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            padding: 8px 12px;
+            background-color: #3D3D3D;
+            border: 1px solid #555;
+            border-radius: 6px;
+            cursor: pointer;
+            transition: all 0.3s;
+            white-space: nowrap;
+        }
+        .tab:hover {
+            background-color: #4D4D4D;
+        }
+        .tab.active {
+            background-color: #0066CC;
+            border-color: #0066CC;
+        }
+        .tab-ticker {
+            font-weight: bold;
+            color: #FFF;
+        }
+        .tab-close {
+            background: none;
+            border: none;
+            color: #FFF;
+            font-size: 18px;
+            cursor: pointer;
+            padding: 0;
+            width: 20px;
+            height: 20px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            border-radius: 3px;
+        }
+        .tab-close:hover {
+            background-color: rgba(255, 0, 0, 0.5);
+        }
+        .tab-add {
+            background-color: #28A745;
+            border: none;
+            color: #FFF;
+            font-size: 20px;
+            font-weight: bold;
+            padding: 8px 16px;
+            border-radius: 6px;
+            cursor: pointer;
+            transition: background-color 0.3s;
+        }
+        .tab-add:hover {
+            background-color: #218838;
+        }
+        .tab-add:disabled {
+            background-color: #555;
+            cursor: not-allowed;
+        }
+        .tab-content {
+            display: none;
+        }
+        .tab-content.active {
+            display: block;
+        }
+
         .chart-grid {
             display: grid;
             grid-template-columns: 1fr;
@@ -4474,6 +4697,20 @@ def index():
         <span class="error-close" onclick="hideError()">&times;</span>
         <div id="error-message"></div>
     </div>
+
+    <!-- Tab Navigation -->
+    <div class="tabs-container">
+        <div class="tabs-nav" id="tabs-nav">
+            <div class="tab active" data-tab-id="0">
+                <span class="tab-ticker">SPY</span>
+                <button class="tab-close" title="Close tab" style="display: none;">&times;</button>
+            </div>
+            <button class="tab-add" id="add-tab-btn" title="Add new tab (max 6)">+</button>
+        </div>
+    </div>
+
+    <!-- Tab Content 0 -->
+    <div class="tab-content active" data-tab-id="0">
     <div class="container">
         <div class="header">
             <div class="header-top">
@@ -4706,6 +4943,57 @@ def index():
                         </select>
                     </div>
                     <div class="control-group">
+                        <label for="timezone">Timezone:</label>
+                        <select id="timezone">
+                            <optgroup label="USA">
+                                <option value="America/New_York" selected>Eastern (ET)</option>
+                                <option value="America/Chicago">Central (CT)</option>
+                                <option value="America/Denver">Mountain (MT)</option>
+                                <option value="America/Los_Angeles">Pacific (PT)</option>
+                                <option value="America/Anchorage">Alaska (AKT)</option>
+                                <option value="Pacific/Honolulu">Hawaii (HST)</option>
+                            </optgroup>
+                            <optgroup label="Europe">
+                                <option value="Euro8pe/London">London (GMT/BST)</option>
+                                <option value="Europe/Paris">Paris (CET)</option>
+                                <option value="Europe/Berlin">Berlin (CET)</option>
+                                <option value="Europe/Rome">Rome (CET)</option>
+                                <option value="Europe/Madrid">Madrid (CET)</option>
+                                <option value="Europe/Amsterdam">Amsterdam (CET)</option>
+                                <option value="Europe/Brussels">Brussels (CET)</option>
+                                <option value="Europe/Zurich">Zurich (CET)</option>
+                                <option value="Europe/Vienna">Vienna (CET)</option>
+                                <option value="Europe/Stockholm">Stockholm (CET)</option>
+                                <option value="Europe/Copenhagen">Copenhagen (CET)</option>
+                                <option value="Europe/Oslo">Oslo (CET)</option>
+                                <option value="Europe/Helsinki">Helsinki (EET)</option>
+                                <option value="Europe/Athens">Athens (EET)</option>
+                                <option value="Europe/Istanbul">Istanbul (TRT)</option>
+                                <option value="Europe/Moscow">Moscow (MSK)</option>
+                            </optgroup>
+                            <optgroup label="Asia">
+                                <option value="Asia/Dubai">Dubai (GST)</option>
+                                <option value="Asia/Karachi">Karachi (PKT)</option>
+                                <option value="Asia/Kolkata">Mumbai/Delhi (IST)</option>
+                                <option value="Asia/Dhaka">Dhaka (BST)</option>
+                                <option value="Asia/Bangkok">Bangkok (ICT)</option>
+                                <option value="Asia/Singapore">Singapore (SGT)</option>
+                                <option value="Asia/Hong_Kong">Hong Kong (HKT)</option>
+                                <option value="Asia/Shanghai">Shanghai (CST)</option>
+                                <option value="Asia/Tokyo">Tokyo (JST)</option>
+                                <option value="Asia/Seoul">Seoul (KST)</option>
+                                <option value="Asia/Taipei">Taipei (CST)</option>
+                                <option value="Asia/Jakarta">Jakarta (WIB)</option>
+                                <option value="Asia/Manila">Manila (PHT)</option>
+                            </optgroup>
+                            <optgroup label="Australia/Pacific">
+                                <option value="Australia/Sydney">Sydney (AEDT)</option>
+                                <option value="Australia/Melbourne">Melbourne (AEDT)</option>
+                                <option value="Pacific/Auckland">Auckland (NZDT)</option>
+                            </optgroup>
+                        </select>
+                    </div>
+                    <div class="control-group">
                         <label>Expiry:</label>
                         <div class="expiry-dropdown">
                             <div class="expiry-display" id="expiry-display">
@@ -4924,7 +5212,7 @@ def index():
                 <label for="centroid">Call vs Put Centroid Map</label>
             </div>
         </div>
-        
+
         <div class="chart-grid" id="chart-grid">
             <div class="price-chart-container">
                 <div class="chart-container" id="price-chart"></div>
@@ -4934,6 +5222,8 @@ def index():
             </div>
         </div>
     </div>
+    </div>
+    <!-- End Tab Content 0 -->
 
     <script>
         let charts = {};
@@ -4947,6 +5237,347 @@ def index():
         let isStreaming = true;
         let savedScrollPosition = 0; // Track scroll position
         let chartContainerCache = {}; // Cache for chart containers to prevent recreation
+
+        // --- Tab Management ---
+        let tabs = [{ id: 0, name: 'SPY' }];
+        let activeTabId = 0;
+        const MAX_TABS = 6;
+
+        // Store original DOM methods FIRST before any functions use them
+        const originalGetElementById = document.getElementById.bind(document);
+        const originalQuerySelector = document.querySelector.bind(document);
+        const originalQuerySelectorAll = document.querySelectorAll.bind(document);
+
+        function initTabManagement() {
+            // Add tab button using original methods
+            originalGetElementById('add-tab-btn').addEventListener('click', addNewTab);
+
+            // Tab click handlers using original methods
+            originalGetElementById('tabs-nav').addEventListener('click', (e) => {
+                const tab = e.target.closest('.tab');
+                if (tab && !e.target.classList.contains('tab-close')) {
+                    switchTab(parseInt(tab.dataset.tabId));
+                }
+
+                if (e.target.classList.contains('tab-close')) {
+                    e.stopPropagation();
+                    closeTab(parseInt(e.target.closest('.tab').dataset.tabId));
+                }
+            });
+
+            updateTabControls();
+        }
+
+        function addNewTab() {
+            if (tabs.length >= MAX_TABS) {
+                alert(`Maximum ${MAX_TABS} tabs allowed`);
+                return;
+            }
+
+            const newId = Math.max(...tabs.map(t => t.id)) + 1;
+
+            // Get the ticker from the current active tab to use as initial name
+            const currentTickerElement = getTabElement(activeTabId, '#ticker');
+            const initialTicker = currentTickerElement ? currentTickerElement.value : 'SPY';
+
+            tabs.push({ id: newId, name: initialTicker });
+
+            // Create tab HTML using original methods
+            const tabsNav = originalGetElementById('tabs-nav');
+            const addBtn = originalGetElementById('add-tab-btn');
+
+            const newTab = document.createElement('div');
+            newTab.className = 'tab';
+            newTab.dataset.tabId = newId;
+            newTab.innerHTML = `
+                <span class="tab-ticker">${initialTicker}</span>
+                <button class="tab-close" title="Close tab">&times;</button>
+            `;
+
+            tabsNav.insertBefore(newTab, addBtn);
+
+            // Clone the entire first tab content (container with everything) using original methods
+            const originalContent = originalQuerySelector('.tab-content[data-tab-id="0"]');
+            const newTabContent = originalContent.cloneNode(true);
+            newTabContent.className = 'tab-content';
+            newTabContent.dataset.tabId = newId;
+
+            // Clear any existing Plotly charts in the cloned content
+            const chartContainers = newTabContent.querySelectorAll('.chart-container');
+            chartContainers.forEach(container => {
+                container.innerHTML = '';
+            });
+
+            // Update IDs to make them unique for this tab
+            updateElementIds(newTabContent, newId);
+
+            // Insert after the last tab content using original methods
+            const allTabContents = originalQuerySelectorAll('.tab-content');
+            const lastTabContent = allTabContents[allTabContents.length - 1];
+            lastTabContent.parentNode.insertBefore(newTabContent, lastTabContent.nextSibling);
+
+            switchTab(newId);
+            updateTabControls();
+
+            // Reinitialize event listeners for the new tab
+            initTabEventListeners(newId);
+
+            // Load expirations and trigger initial data load for the new tab
+            setTimeout(() => {
+                loadExpirationsForTab(newId);
+                updateDataForTab(newId);
+            }, 100);
+        }
+
+        function updateElementIds(element, tabId) {
+            // Add tab-specific prefix to IDs to avoid conflicts
+            const elementsWithIds = element.querySelectorAll('[id]');
+            elementsWithIds.forEach(el => {
+                const oldId = el.id;
+                el.id = `${oldId}-tab-${tabId}`;
+            });
+        }
+
+        function initTabEventListeners(tabId) {
+            // Get tab-specific element IDs using original methods
+            const tabContent = originalQuerySelector(`.tab-content[data-tab-id="${tabId}"]`);
+            if (!tabContent) return;
+
+            // Initialize controls for this tab
+            const ticker = tabContent.querySelector('[id^="ticker-"]');
+            if (ticker) {
+                ticker.addEventListener('change', function() {
+                    if (activeTabId === tabId) {
+                        loadExpirations();
+                        // Update tab name when ticker changes
+                        updateTabName(tabId, this.value);
+                    }
+                });
+            }
+
+            const streamToggle = tabContent.querySelector('[id^="streamToggle-"]');
+            if (streamToggle) {
+                streamToggle.addEventListener('click', () => {
+                    if (activeTabId === tabId) toggleStreaming();
+                });
+            }
+
+            // Add other event listeners as needed
+        }
+
+        function switchTab(tabId) {
+            // Switch active tab
+            activeTabId = tabId;
+
+            // Update tab UI using original methods
+            originalQuerySelectorAll('.tab').forEach(tab => {
+                tab.classList.toggle('active', parseInt(tab.dataset.tabId) === tabId);
+            });
+
+            // Update content visibility using original methods
+            originalQuerySelectorAll('.tab-content').forEach(content => {
+                content.classList.toggle('active', parseInt(content.dataset.tabId) === tabId);
+            });
+
+            // Force update data for the newly active tab
+            setTimeout(() => {
+                updateData();
+            }, 150);
+        }
+
+        function updateTabName(tabId, ticker) {
+            const tab = originalQuerySelector(`.tab[data-tab-id="${tabId}"]`);
+            if (tab) {
+                const tabTickerSpan = tab.querySelector('.tab-ticker');
+                if (tabTickerSpan) {
+                    tabTickerSpan.textContent = ticker;
+                }
+            }
+
+            // Update the tab object
+            const tabObj = tabs.find(t => t.id === tabId);
+            if (tabObj) {
+                tabObj.name = ticker;
+            }
+        }
+
+        function closeTab(tabId) {
+            if (tabs.length === 1) {
+                alert('Cannot close the last tab');
+                return;
+            }
+
+            tabs = tabs.filter(t => t.id !== tabId);
+
+            // Remove tab UI using original methods
+            const tab = originalQuerySelector(`.tab[data-tab-id="${tabId}"]`);
+            if (tab) tab.remove();
+
+            // Remove tab content using original methods
+            const content = originalQuerySelector(`.tab-content[data-tab-id="${tabId}"]`);
+            if (content) content.remove();
+
+            // If closing active tab, switch to first available
+            if (activeTabId === tabId) {
+                switchTab(tabs[0].id);
+            }
+
+            updateTabControls();
+        }
+
+        function updateTabControls() {
+            const addBtn = originalGetElementById('add-tab-btn');
+            if (addBtn) {
+                addBtn.disabled = tabs.length >= MAX_TABS;
+            }
+
+            // Show/hide close buttons using original methods
+            const showClose = tabs.length > 1;
+            originalQuerySelectorAll('.tab-close').forEach(btn => {
+                btn.style.display = showClose ? 'flex' : 'none';
+            });
+        }
+
+        function getActiveTabElement(selector) {
+            const activeContent = originalQuerySelector(`.tab-content[data-tab-id="${activeTabId}"]`);
+            return activeContent ? activeContent.querySelector(selector) : originalQuerySelector(selector);
+        }
+
+        function getTabElement(tabId, selector) {
+            const tabContent = originalQuerySelector(`.tab-content[data-tab-id="${tabId}"]`);
+            if (!tabContent) return null;
+
+            // If selector starts with #, we need to handle the tab-specific ID
+            if (selector.startsWith('#')) {
+                const baseId = selector.substring(1);
+                if (tabId === 0) {
+                    return tabContent.querySelector(selector);
+                } else {
+                    return tabContent.querySelector(`#${baseId}-tab-${tabId}`);
+                }
+            }
+            return tabContent.querySelector(selector);
+        }
+
+        // Smart approach: Override document methods to scope to active tab content
+        document.getElementById = function(id) {
+            // Don't intercept for tab navigation elements or error notifications
+            if (id === 'tabs-nav' || id === 'add-tab-btn' || id === 'error-notification' || id === 'error-message') {
+                return originalGetElementById(id);
+            }
+
+            // Get from active tab
+            const element = getTabElement(activeTabId, '#' + id);
+            if (element) return element;
+
+            // Fallback to original
+            return originalGetElementById(id);
+        };
+
+        document.querySelector = function(selector) {
+            // Don't intercept for tab-related or global selectors
+            if (selector.includes('.tab-content') ||
+                selector.includes('.tab[data-tab-id') ||
+                selector.includes('#tabs-nav') ||
+                selector.includes('#error-notification')) {
+                return originalQuerySelector(selector);
+            }
+
+            // Scope to active tab for content-related selectors
+            if (selector.includes('.expiry-option') ||
+                selector.includes('.levels-option') ||
+                selector.includes('.chart-checkbox') ||
+                selector.includes('.chart-container') ||
+                selector.includes('.control-group') ||
+                selector.includes('#chart-grid') ||
+                selector.includes('.header')) {
+                const activeContent = originalQuerySelector(`.tab-content[data-tab-id="${activeTabId}"]`);
+                if (activeContent) {
+                    const result = activeContent.querySelector(selector);
+                    if (result) return result;
+                }
+            }
+
+            return originalQuerySelector(selector);
+        };
+
+        document.querySelectorAll = function(selector) {
+            // Don't intercept for tab-related selectors
+            if (selector.includes('.tab-content') ||
+                selector.includes('.tab[data-tab-id') ||
+                selector.includes('.tab-close')) {
+                return originalQuerySelectorAll(selector);
+            }
+
+            // Scope to active tab for content-related selectors
+            if (selector.includes('.expiry-option') ||
+                selector.includes('.levels-option') ||
+                selector.includes('.chart-checkbox') ||
+                selector.includes('.chart-container') ||
+                selector.includes('.control-group')) {
+                const activeContent = originalQuerySelector(`.tab-content[data-tab-id="${activeTabId}"]`);
+                if (activeContent) {
+                    return activeContent.querySelectorAll(selector);
+                }
+            }
+
+            return originalQuerySelectorAll(selector);
+        };
+
+        function loadExpirationsForTab(tabId) {
+            const tickerElement = getTabElement(tabId, '#ticker');
+            if (!tickerElement) return;
+
+            const ticker = tickerElement.value;
+            fetch(`/expirations/${ticker}`)
+                .then(response => {
+                    if (!response.ok) throw new Error('Failed to fetch expirations');
+                    return response.json();
+                })
+                .then(data => {
+                    // Get the expiry options container for this tab
+                    const expiryOptions = getTabElement(tabId, '#expiry-options');
+                    if (!expiryOptions) return;
+
+                    // Clear existing options except buttons
+                    const buttons = expiryOptions.querySelector('.expiry-buttons');
+                    expiryOptions.innerHTML = '';
+                    if (buttons) expiryOptions.appendChild(buttons);
+
+                    // Add new expiry options
+                    data.expirations.forEach(exp => {
+                        const checkbox = document.createElement('input');
+                        checkbox.type = 'checkbox';
+                        checkbox.id = `exp-${exp}-tab-${tabId}`;
+                        checkbox.value = exp;
+                        checkbox.checked = true;
+
+                        const label = document.createElement('label');
+                        label.htmlFor = checkbox.id;
+                        label.textContent = exp;
+
+                        const div = document.createElement('div');
+                        div.className = 'expiry-option';
+                        div.appendChild(checkbox);
+                        div.appendChild(label);
+
+                        expiryOptions.insertBefore(div, buttons);
+                    });
+
+                    // Trigger update for this tab
+                    if (activeTabId === tabId) {
+                        updateData();
+                    }
+                })
+                .catch(error => console.error('Error loading expirations:', error));
+        }
+
+        function updateDataForTab(tabId) {
+            // Simply trigger updateData if this is the active tab
+            if (activeTabId === tabId) {
+                updateData();
+            }
+        }
 
         // --- Fullscreen chart support ---
         const fsExpandSvg = '<svg viewBox="0 0 14 14" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M1 5V1h4M9 1h4v4M13 9v4H9M5 13H1V9"/></svg>';
@@ -5202,6 +5833,7 @@ def index():
 
         // Coloring mode listeners
         document.getElementById('timeframe').addEventListener('change', updateData);
+        document.getElementById('timezone').addEventListener('change', updateData);
         document.getElementById('coloring_mode').addEventListener('change', updateData);
         document.getElementById('exposure_metric').addEventListener('change', updateData);
         document.getElementById('levels_count').addEventListener('input', updateData);
@@ -5464,15 +6096,18 @@ def index():
                 show_centroid: document.getElementById('centroid').checked
             };
             
+            const timezone = document.getElementById('timezone') ? document.getElementById('timezone').value : 'America/New_York';
+
             fetch('/update', {
                 method: 'POST',
                 headers: {
                     'Content-Type': 'application/json',
                 },
-                body: JSON.stringify({ 
-                    ticker, 
+                body: JSON.stringify({
+                    ticker,
                     expiry,
                     timeframe: document.getElementById('timeframe').value,
+                    timezone: timezone,
                     show_calls: showCalls,
                     show_puts: showPuts,
                     show_net: showNet,
@@ -5975,7 +6610,12 @@ def index():
             checkbox.addEventListener('change', updateData);
         });
         
-        document.getElementById('ticker').addEventListener('change', loadExpirations);
+        document.getElementById('ticker').addEventListener('change', function() {
+            loadExpirations();
+            // Update tab name to reflect ticker change
+            const ticker = this.value;
+            updateTabName(activeTabId, ticker);
+        });
         
         // Add event listeners for dropdown toggle
         document.getElementById('expiry-display').addEventListener('click', function(e) {
@@ -6023,6 +6663,9 @@ def index():
             updateExpiryDisplay();
             updateData();
         });
+
+        // Initialize tab management
+        initTabManagement();
 
         // Initial load - automatically load saved settings, or use defaults
         loadSettings(false);
@@ -6371,11 +7014,12 @@ def update():
         if current_time.hour == 23 and current_time.minute == 59:
             clear_old_data()
         
-        # Get timeframe from request
+        # Get timeframe and timezone from request
         timeframe = int(data.get('timeframe', 1))
+        timezone = data.get('timezone', 'America/New_York')
 
-        # Get fresh price data
-        price_data = get_price_history(ticker, timeframe=timeframe)
+        # Get fresh price data with timezone
+        price_data = get_price_history(ticker, timeframe=timeframe, timezone=timezone)
         
         # Calculate volumes and other metrics
         use_range = data.get('use_range', False)  # Rename to use_range for clarity
@@ -6441,7 +7085,8 @@ def update():
                 strike_range=strike_range,
                 use_heikin_ashi=use_heikin_ashi,
                 highlight_max_level=highlight_max_level,
-                max_level_color=max_level_color
+                max_level_color=max_level_color,
+                timezone=timezone
             )
         
         if data.get('show_gex_historical_bubble', True):
